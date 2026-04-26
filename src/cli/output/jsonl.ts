@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { z } from 'zod';
@@ -181,6 +181,104 @@ function aggregateUsage(reports: SkillReport[]): UsageStats | undefined {
 }
 
 /**
+ * Build a JSONL run metadata block. `durationMs` is a snapshot at write
+ * time for skill records, the run total on the trailing summary record.
+ */
+export function buildRunMetadata(options: {
+  runId: string;
+  durationMs: number;
+  timestamp?: Date;
+  traceId?: string;
+  model?: string;
+  headSha?: string;
+  cwd?: string;
+}): JsonlRunMetadata {
+  return {
+    timestamp: (options.timestamp ?? new Date()).toISOString(),
+    durationMs: options.durationMs,
+    cwd: options.cwd ?? process.cwd(),
+    runId: options.runId,
+    traceId: options.traceId,
+    model: options.model,
+    headSha: options.headSha,
+  };
+}
+
+/** Build a skill JSONL record, dropping zero-valued optional fields. */
+export function buildSkillJsonlRecord(report: SkillReport, run: JsonlRunMetadata): JsonlRecord {
+  const trimmed: SkillReport = {
+    ...report,
+    skippedFiles: report.skippedFiles?.length ? report.skippedFiles : undefined,
+    failedHunks: report.failedHunks || undefined,
+    failedExtractions: report.failedExtractions || undefined,
+    hunkFailures: report.hunkFailures?.length ? report.hunkFailures : undefined,
+  };
+  return { ...trimmed, run };
+}
+
+/** Build the aggregate summary JSONL record. */
+export function buildSummaryJsonlRecord(
+  reports: SkillReport[],
+  run: JsonlRunMetadata,
+  error?: SkillError
+): JsonlSummaryRecord {
+  const allFindings = reports.flatMap((r) => r.findings);
+  const totalSkippedFiles = reports.reduce((n, r) => n + (r.skippedFiles?.length ?? 0), 0);
+  const totalAuxiliaryUsage = reports.reduce<AuxiliaryUsageMap | undefined>(
+    (acc, r) => mergeAuxiliaryUsage(acc, r.auxiliaryUsage),
+    undefined
+  );
+  const failedSkills = reports.filter((r) => r.error).map((r) => r.skill);
+  const totalFailedHunks = reports.reduce((n, r) => n + (r.failedHunks ?? 0), 0);
+  const totalFailedExtractions = reports.reduce((n, r) => n + (r.failedExtractions ?? 0), 0);
+  return {
+    run,
+    type: 'summary',
+    totalFindings: allFindings.length,
+    bySeverity: countBySeverity(allFindings),
+    usage: aggregateUsage(reports),
+    totalSkippedFiles: totalSkippedFiles > 0 ? totalSkippedFiles : undefined,
+    auxiliaryUsage: totalAuxiliaryUsage,
+    failedSkills: failedSkills.length > 0 ? failedSkills : undefined,
+    totalFailedHunks: totalFailedHunks > 0 ? totalFailedHunks : undefined,
+    totalFailedExtractions: totalFailedExtractions > 0 ? totalFailedExtractions : undefined,
+    error,
+  };
+}
+
+/** Render a single skill JSONL record as one line including trailing newline. */
+export function renderJsonlSkillLine(report: SkillReport, run: JsonlRunMetadata): string {
+  return JSON.stringify(buildSkillJsonlRecord(report, run)) + '\n';
+}
+
+/** Render the summary JSONL record as one line including trailing newline. */
+export function renderJsonlSummaryLine(
+  reports: SkillReport[],
+  run: JsonlRunMetadata,
+  error?: SkillError
+): string {
+  return JSON.stringify(buildSummaryJsonlRecord(reports, run, error)) + '\n';
+}
+
+/** Create parent dirs and truncate the file to empty. */
+export function initJsonlFile(outputPath: string): void {
+  const resolvedPath = resolve(process.cwd(), outputPath);
+  mkdirSync(dirname(resolvedPath), { recursive: true });
+  writeFileSync(resolvedPath, '');
+}
+
+/**
+ * Append a pre-rendered line (must include its trailing newline).
+ * Atomic w.r.t. other appenders on POSIX for lines under PIPE_BUF, which
+ * is what makes parallel skill execution safe to write straight to disk.
+ */
+export function appendJsonlLine(outputPath: string, line: string): void {
+  const resolvedPath = resolve(process.cwd(), outputPath);
+  mkdirSync(dirname(resolvedPath), { recursive: true });
+  appendFileSync(resolvedPath, line);
+}
+
+/**
  * Render skill reports as a JSONL string.
  * Each line contains one skill report with run metadata.
  * A final summary line is appended at the end.
@@ -199,57 +297,21 @@ export function renderJsonlString(
     error?: SkillError;
   }
 ): string {
-  const timestamp = (options?.timestamp ?? new Date()).toISOString();
-  const cwd = options?.cwd ?? process.cwd();
-
-  const runMetadata: JsonlRunMetadata = {
-    timestamp,
-    durationMs,
-    cwd,
+  const runMetadata = buildRunMetadata({
     runId: options?.runId ?? generateRunId(),
+    durationMs,
+    timestamp: options?.timestamp,
     traceId: options?.traceId,
     model: options?.model,
     headSha: options?.headSha,
-  };
+    cwd: options?.cwd,
+  });
 
   const lines: string[] = [];
-
   for (const report of reports) {
-    // Drop empty optional arrays and zero counts so JSONL stays compact.
-    const trimmed: SkillReport = {
-      ...report,
-      skippedFiles: report.skippedFiles?.length ? report.skippedFiles : undefined,
-      failedHunks: report.failedHunks || undefined,
-      failedExtractions: report.failedExtractions || undefined,
-      hunkFailures: report.hunkFailures?.length ? report.hunkFailures : undefined,
-    };
-    const record: JsonlRecord = { ...trimmed, run: runMetadata };
-    lines.push(JSON.stringify(record));
+    lines.push(JSON.stringify(buildSkillJsonlRecord(report, runMetadata)));
   }
-
-  const allFindings = reports.flatMap((r) => r.findings);
-  const totalSkippedFiles = reports.reduce((n, r) => n + (r.skippedFiles?.length ?? 0), 0);
-  const totalAuxiliaryUsage = reports.reduce<AuxiliaryUsageMap | undefined>(
-    (acc, r) => mergeAuxiliaryUsage(acc, r.auxiliaryUsage),
-    undefined
-  );
-  const failedSkills = reports.filter((r) => r.error).map((r) => r.skill);
-  const totalFailedHunks = reports.reduce((n, r) => n + (r.failedHunks ?? 0), 0);
-  const totalFailedExtractions = reports.reduce((n, r) => n + (r.failedExtractions ?? 0), 0);
-  const summaryRecord: JsonlSummaryRecord = {
-    run: runMetadata,
-    type: 'summary',
-    totalFindings: allFindings.length,
-    bySeverity: countBySeverity(allFindings),
-    usage: aggregateUsage(reports),
-    totalSkippedFiles: totalSkippedFiles > 0 ? totalSkippedFiles : undefined,
-    auxiliaryUsage: totalAuxiliaryUsage,
-    failedSkills: failedSkills.length > 0 ? failedSkills : undefined,
-    totalFailedHunks: totalFailedHunks > 0 ? totalFailedHunks : undefined,
-    totalFailedExtractions: totalFailedExtractions > 0 ? totalFailedExtractions : undefined,
-    error: options?.error,
-  };
-  lines.push(JSON.stringify(summaryRecord));
+  lines.push(JSON.stringify(buildSummaryJsonlRecord(reports, runMetadata, options?.error)));
 
   return lines.join('\n') + '\n';
 }
@@ -340,11 +402,15 @@ export function parseJsonlReports(content: string): ParsedJsonlLog {
 }
 
 /**
- * Lightweight metadata extracted from a JSONL log file.
- * Includes the summary record plus skill names from the skill records.
+ * Lightweight metadata extracted from a JSONL log file. `summary` is
+ * absent for in-progress runs (no trailing summary record yet); use
+ * `inProgress` to distinguish those from completed runs.
  */
 export interface LogFileMetadata {
-  summary: JsonlSummaryRecord;
+  summary?: JsonlSummaryRecord;
+  inProgress: boolean;
+  /** Run metadata pulled from the summary or, failing that, the first skill record. */
+  runMetadata?: JsonlRunMetadata;
   skills: string[];
   model?: string;
   headSha?: string;
@@ -352,64 +418,82 @@ export interface LogFileMetadata {
 }
 
 /**
- * Parse a JSONL log file for its summary and skill names.
- * Reads all lines but only fully parses the summary; extracts skill names
- * from non-summary lines with minimal parsing.
+ * Parse a JSONL log file's summary, skill names, and high-level metadata.
+ * Returns undefined when the file can't be read or contains no parseable
+ * records; in-progress files (valid records but no summary yet) return
+ * metadata with `inProgress: true`.
  */
 export function parseLogMetadata(filePath: string): LogFileMetadata | undefined {
+  let content: string;
   try {
-    const content = readFileSync(filePath, 'utf-8');
-    const lines = content.trim().split('\n');
-
-    let summary: JsonlSummaryRecord | undefined;
-    const skills: string[] = [];
-    let model: string | undefined;
-    let headSha: string | undefined;
-    const uniqueFiles = new Set<string>();
-
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const parsed = JSON.parse(line);
-        if (parsed.type === 'summary') {
-          summary = JsonlSummaryRecordSchema.parse(parsed);
-          // Fall back to summary's run metadata for model/headSha (empty runs have no skill records)
-          if (!model && parsed.run?.model && typeof parsed.run.model === 'string') {
-            model = parsed.run.model;
-          }
-          if (!headSha && parsed.run?.headSha && typeof parsed.run.headSha === 'string') {
-            headSha = parsed.run.headSha;
-          }
-        } else if (parsed.skill && typeof parsed.skill === 'string') {
-          if (!skills.includes(parsed.skill)) {
-            skills.push(parsed.skill);
-          }
-          // Extract model and headSha from first record's run metadata
-          if (!model && parsed.run?.model && typeof parsed.run.model === 'string') {
-            model = parsed.run.model;
-          }
-          if (!headSha && parsed.run?.headSha && typeof parsed.run.headSha === 'string') {
-            headSha = parsed.run.headSha;
-          }
-          // Count unique filenames across skill records' files arrays
-          if (Array.isArray(parsed.files)) {
-            for (const f of parsed.files) {
-              if (f && typeof f.filename === 'string') {
-                uniqueFiles.add(f.filename);
-              }
-            }
-          }
-        }
-      } catch (err) {
-        logger.warn('Skipping malformed JSONL line', {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-
-    if (!summary) return undefined;
-    return { summary, skills, model, headSha, totalFiles: uniqueFiles.size };
+    content = readFileSync(filePath, 'utf-8');
   } catch {
     return undefined;
   }
+  const lines = content.trim().split('\n').filter((l) => l.trim());
+
+  let summary: JsonlSummaryRecord | undefined;
+  let firstRun: JsonlRunMetadata | undefined;
+  const skills: string[] = [];
+  let model: string | undefined;
+  let headSha: string | undefined;
+  const uniqueFiles = new Set<string>();
+  let recognizedRecords = 0;
+
+  for (const line of lines) {
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed.type === 'summary') {
+        summary = JsonlSummaryRecordSchema.parse(parsed);
+        recognizedRecords++;
+        if (!model && parsed.run?.model && typeof parsed.run.model === 'string') {
+          model = parsed.run.model;
+        }
+        if (!headSha && parsed.run?.headSha && typeof parsed.run.headSha === 'string') {
+          headSha = parsed.run.headSha;
+        }
+        if (!firstRun) firstRun = summary.run;
+      } else if (parsed.skill && typeof parsed.skill === 'string') {
+        recognizedRecords++;
+        if (!skills.includes(parsed.skill)) {
+          skills.push(parsed.skill);
+        }
+        if (!model && parsed.run?.model && typeof parsed.run.model === 'string') {
+          model = parsed.run.model;
+        }
+        if (!headSha && parsed.run?.headSha && typeof parsed.run.headSha === 'string') {
+          headSha = parsed.run.headSha;
+        }
+        if (!firstRun && parsed.run) {
+          const runResult = JsonlRunMetadataSchema.safeParse(parsed.run);
+          if (runResult.success) firstRun = runResult.data;
+        }
+        if (Array.isArray(parsed.files)) {
+          for (const f of parsed.files) {
+            if (f && typeof f.filename === 'string') {
+              uniqueFiles.add(f.filename);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn('Skipping malformed JSONL line', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // Empty or fully corrupt files (no parseable records) surface as
+  // "parse error" in the list, not as in-progress runs.
+  if (recognizedRecords === 0 && lines.length > 0) return undefined;
+
+  return {
+    summary,
+    inProgress: !summary,
+    runMetadata: summary?.run ?? firstRun,
+    skills,
+    model,
+    headSha,
+    totalFiles: uniqueFiles.size,
+  };
 }

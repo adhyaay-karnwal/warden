@@ -138,6 +138,8 @@ export interface RunTasksOptions {
   concurrency: number;
   /** Controller that fires when fail-fast detects a finding. Created by caller. */
   failFastController?: AbortController;
+  /** Hook fired after each skill finishes; used by the CLI to stream JSONL to disk. */
+  onSkillComplete?: (report: SkillReport) => void;
 }
 
 /**
@@ -211,18 +213,21 @@ export async function runSkillTask(
 
         if (preparedFiles.length === 0) {
           // No files to analyze - skip
+          const skippedReport: SkillReport = {
+            skill: skill.name,
+            summary: 'No code changes to analyze',
+            findings: [],
+            usage: { inputTokens: 0, outputTokens: 0, costUSD: 0 },
+            durationMs: Date.now() - startTime,
+            model: runnerOptions?.model,
+            skippedFiles: skippedFiles.length > 0 ? skippedFiles : undefined,
+          };
           callbacks.onSkillSkipped(name);
+          // Also fire onSkillComplete so the incremental JSONL writer records the skipped skill.
+          callbacks.onSkillComplete(name, skippedReport);
           return {
             name,
-            report: {
-              skill: skill.name,
-              summary: 'No code changes to analyze',
-              findings: [],
-              usage: { inputTokens: 0, outputTokens: 0, costUSD: 0 },
-              durationMs: Date.now() - startTime,
-              model: runnerOptions?.model,
-              skippedFiles: skippedFiles.length > 0 ? skippedFiles : undefined,
-            },
+            report: skippedReport,
             failOn,
             minConfidence,
           };
@@ -437,7 +442,7 @@ export async function runSkillTask(
             durationMs: duration,
             model: runnerOptions?.model,
             // Preserve per-file metadata (timing, partial usage, attempted
-            // filenames) on failure runs too — `warden logs` and JSONL
+            // filenames) on failure runs too — `warden runs` and JSONL
             // consumers iterate this array to count attempted files. Without
             // it, a failed run shows totalFiles: 0.
             files: preparedFiles.map((file, i) => {
@@ -615,6 +620,10 @@ export function createDefaultCallbacks(
   /** Track per-skill skipped file counts for collapsed summary in non-TTY mode. */
   const skippedCounts = new Map<string, number>();
 
+  // Skipped skills also fire onSkillComplete (for the JSONL writer).
+  // Suppress the duplicate "completed" line for those names.
+  const skippedSkills = new Set<string>();
+
   return {
     onSkillStart: (skill) => {
       if (verbosity === Verbosity.Quiet) return;
@@ -643,6 +652,7 @@ export function createDefaultCallbacks(
     },
     onSkillComplete: (name, report) => {
       if (verbosity === Verbosity.Quiet) return;
+      if (skippedSkills.has(name)) return;
       const displayName = displayNameFor(name);
 
       // Errored runs render as failures, not as misleading "completed -
@@ -697,6 +707,7 @@ export function createDefaultCallbacks(
       }
     },
     onSkillSkipped: (name) => {
+      skippedSkills.add(name);
       if (verbosity === Verbosity.Quiet) return;
       const displayName = displayNameFor(name);
       if (mode.isTTY) {
@@ -847,7 +858,7 @@ export async function runSkillTasks(
   options: RunTasksOptions,
   callbacks?: SkillProgressCallbacks
 ): Promise<SkillTaskResult[]> {
-  const { mode, verbosity, concurrency, failFastController } = options;
+  const { mode, verbosity, concurrency, failFastController, onSkillComplete } = options;
 
   // Global semaphore gates file-level work across all skills.
   // All skills launch immediately so the UI shows them as "running",
@@ -856,18 +867,27 @@ export async function runSkillTasks(
 
   const effectiveCallbacks = callbacks ?? createDefaultCallbacks(tasks, mode, verbosity);
 
-  // Wrap onFileUpdate to detect findings and trigger fail-fast
-  const wrappedCallbacks: SkillProgressCallbacks = failFastController
-    ? {
-        ...effectiveCallbacks,
-        onFileUpdate: (skillName, filename, updates) => {
-          effectiveCallbacks.onFileUpdate(skillName, filename, updates);
-          if (updates.status === 'done' && updates.findings && updates.findings.length > 0) {
-            failFastController.abort();
-          }
-        },
-      }
-    : effectiveCallbacks;
+  const wrappedCallbacks: SkillProgressCallbacks = {
+    ...effectiveCallbacks,
+    ...(failFastController
+      ? {
+          onFileUpdate: (skillName: string, filename: string, updates: Partial<FileState>) => {
+            effectiveCallbacks.onFileUpdate(skillName, filename, updates);
+            if (updates.status === 'done' && updates.findings && updates.findings.length > 0) {
+              failFastController.abort();
+            }
+          },
+        }
+      : {}),
+    ...(onSkillComplete
+      ? {
+          onSkillComplete: (name: string, report: SkillReport) => {
+            effectiveCallbacks.onSkillComplete(name, report);
+            try { onSkillComplete(report); } catch { /* streaming hook must not break the run */ }
+          },
+        }
+      : {}),
+  };
 
   // Output SKILLS header (TTY only - in log mode, "Running..." lines are sufficient)
   if (verbosity !== Verbosity.Quiet && tasks.length > 0 && mode.isTTY) {

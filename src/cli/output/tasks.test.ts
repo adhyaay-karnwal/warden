@@ -403,6 +403,21 @@ describe('createDefaultCallbacks', () => {
       const msg = errorSpy.mock.calls[0]![0] as string;
       expect(msg).toMatch(/\[.*\] warden: code-scanner skipped/);
     });
+
+    it('suppresses the duplicate completed line when onSkillComplete fires after onSkillSkipped', () => {
+      // The skip path fires both callbacks (onSkillComplete for the
+      // JSONL writer); plain output must show "skipped" only.
+      const tasks = [makeTask('my-trigger', 'code-scanner')];
+      const cb = createDefaultCallbacks(tasks, logMode(), Verbosity.Normal);
+
+      cb.onSkillSkipped('my-trigger');
+      cb.onSkillComplete('my-trigger', makeReport({ skill: 'code-scanner', findings: [], durationMs: 0 }));
+
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      const msg = errorSpy.mock.calls[0]![0] as string;
+      expect(msg).toMatch(/code-scanner skipped/);
+      expect(msg).not.toMatch(/completed/);
+    });
   });
 
   describe('onSkillError', () => {
@@ -700,7 +715,7 @@ describe('runSkillTask all-hunks-fail synthesis', () => {
     // error here produces a plain Error downstream and loses classification.
     expect(result.error).toBeInstanceOf(SkillRunnerError);
     expect((result.error as SkillRunnerError).code).toBe('all_hunks_failed');
-    // Per-file metadata must be present even on failure runs — `warden logs`
+    // Per-file metadata must be present even on failure runs — `warden runs`
     // and JSONL consumers count attempted files via report.files. Empty
     // files would show totalFiles: 0 for an all-hunks-failed run.
     expect(result.report!.files).toHaveLength(1);
@@ -759,6 +774,55 @@ describe('runSkillTask all-hunks-fail synthesis', () => {
     expect(result.report!.error?.code).toBe('all_hunks_failed');
     expect(result.report!.failedExtractions).toBe(1);
     expect(result.report!.findings).toEqual([]);
+  });
+});
+
+describe('runSkillTask skipped path', () => {
+  function noopCallbacks(): SkillProgressCallbacks {
+    return {
+      onSkillStart: () => undefined,
+      onSkillUpdate: () => undefined,
+      onFileUpdate: () => undefined,
+      onSkillComplete: () => undefined,
+      onSkillSkipped: () => undefined,
+      onSkillError: () => undefined,
+    };
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('emits onSkillComplete alongside onSkillSkipped so incremental JSONL captures skipped skills', async () => {
+    vi.spyOn(sdkRunner, 'prepareFiles').mockReturnValue({ files: [], skippedFiles: [] });
+
+    const options: SkillTaskOptions = {
+      name: 'no-files-skill',
+      resolveSkill: async () =>
+        ({ name: 'no-files-skill', definition: '', files: [] } as unknown as SkillDefinition),
+      context: {
+        eventType: 'pull_request',
+        repository: { owner: 'o', name: 'n', fullName: 'o/n', defaultBranch: 'main' },
+        repoPath: '/tmp',
+        pullRequest: { number: 1, title: 't', body: '', headSha: 'a', baseSha: 'b', files: [] },
+      } as unknown as SkillTaskOptions['context'],
+    };
+
+    const onSkillSkipped = vi.fn();
+    const onSkillComplete = vi.fn();
+    const result = await runSkillTask(options, 1, {
+      ...noopCallbacks(),
+      onSkillSkipped,
+      onSkillComplete,
+    });
+
+    expect(onSkillSkipped).toHaveBeenCalledExactlyOnceWith('no-files-skill');
+    expect(onSkillComplete).toHaveBeenCalledTimes(1);
+    const [name, report] = onSkillComplete.mock.calls[0]!;
+    expect(name).toBe('no-files-skill');
+    expect(report.skill).toBe('no-files-skill');
+    expect(report.summary).toBe('No code changes to analyze');
+    expect(result.report).toBe(report);
   });
 });
 

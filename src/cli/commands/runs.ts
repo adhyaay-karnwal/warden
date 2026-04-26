@@ -1,9 +1,9 @@
-import { existsSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
+import { existsSync, openSync, closeSync, fstatSync, readSync, readdirSync, readFileSync, unlinkSync, watch } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import chalk from 'chalk';
 import { loadWardenConfig } from '../../config/loader.js';
 import type { ConfidenceThreshold, Severity, SkillReport } from '../../types/index.js';
-import type { CLIOptions, LogsOptions } from '../args.js';
+import type { CLIOptions, RunsOptions } from '../args.js';
 import { getRepoRoot } from '../git.js';
 import { findExpiredArtifacts } from '../log-cleanup.js';
 import { renderTerminalReport, filterReports } from '../terminal.js';
@@ -16,6 +16,8 @@ import {
   parseJsonlReports,
   parseLogMetadata,
   renderJsonlString,
+  JsonlRecordSchema,
+  JsonlSummaryRecordSchema,
   type JsonlRunMetadata,
   type LogFileMetadata,
 } from '../output/index.js';
@@ -32,6 +34,20 @@ function resolveLogDir(): { logDir: string; repoPath: string } | undefined {
     return undefined;
   }
   return { logDir: join(repoPath, '.warden', 'logs'), repoPath };
+}
+
+/**
+ * Recover an ISO timestamp from `{runId8}-{ISO-datetime}.jsonl`.
+ * Used as the list sort key for in-progress runs (no summary yet).
+ */
+function filenameTimestamp(filename: string): string {
+  const match = filename.match(/-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)\.jsonl$/);
+  const stamp = match?.[1];
+  if (!stamp) return '';
+  return stamp.replace(
+    /^(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/,
+    '$1:$2:$3.$4Z',
+  );
 }
 
 /**
@@ -126,9 +142,14 @@ function formatSeverityBreakdown(bySeverity: Partial<Record<Severity, number>>):
 }
 
 /**
- * List all JSONL log files in .warden/logs/.
+ * List sessions in `.warden/logs/`. Empty (no-file, no-skill) runs
+ * are hidden unless `all` is set.
  */
-export async function runLogsList(options: CLIOptions, reporter: Reporter): Promise<number> {
+export async function runRunsList(
+  options: CLIOptions,
+  reporter: Reporter,
+  listOptions: { all?: boolean } = {},
+): Promise<number> {
   const resolved = resolveLogDir();
   if (!resolved) {
     reporter.error('Not a git repository');
@@ -148,36 +169,51 @@ export async function runLogsList(options: CLIOptions, reporter: Reporter): Prom
   }
 
   if (entries.length === 0) {
-    reporter.warning('No log files found');
-    reporter.tip('Run warden to generate logs in .warden/logs/');
+    reporter.warning('No saved sessions found');
+    reporter.tip('Run warden to generate sessions in .warden/logs/');
     return 0;
   }
 
-  // Parse all logs for metadata and sort by timestamp (newest first)
-  const logData: { entry: string; meta: LogFileMetadata | undefined }[] = [];
+  const allLogData: { entry: string; meta: LogFileMetadata | undefined }[] = [];
   for (const entry of entries) {
     const filePath = join(logDir, entry);
-    logData.push({ entry, meta: parseLogMetadata(filePath) });
+    allLogData.push({ entry, meta: parseLogMetadata(filePath) });
   }
-  logData.sort((a, b) => {
-    const tsA = a.meta?.summary.run.timestamp ?? '';
-    const tsB = b.meta?.summary.run.timestamp ?? '';
-    return tsB.localeCompare(tsA);
-  });
+  // In-progress runs have no summary; fall back to the run record's
+  // timestamp, then to the filename, so they sort to the top.
+  const sortKey = (entry: { entry: string; meta: LogFileMetadata | undefined }) =>
+    entry.meta?.summary?.run.timestamp ??
+    entry.meta?.runMetadata?.timestamp ??
+    filenameTimestamp(entry.entry);
+  allLogData.sort((a, b) => sortKey(b).localeCompare(sortKey(a)));
+
+  // Run-level errors (auth, config) stay visible even with zero files —
+  // the error is the point of keeping the record. In-progress runs also
+  // stay visible so users can find the active session.
+  const isEmptyRun = (entry: { meta: LogFileMetadata | undefined }) => {
+    const meta = entry.meta;
+    if (!meta || meta.inProgress) return false;
+    if (meta.summary?.error) return false;
+    return meta.totalFiles === 0 && meta.skills.length === 0;
+  };
+  const showAll = listOptions.all ?? false;
+  const logData = showAll ? allLogData : allLogData.filter((e) => !isEmptyRun(e));
+  const hiddenCount = allLogData.length - logData.length;
 
   if (options.json) {
     const results = logData.map(({ entry, meta }) => ({
       file: entry,
-      runId: meta?.summary.run.runId,
-      timestamp: meta?.summary.run.timestamp,
+      runId: meta?.runMetadata?.runId,
+      timestamp: meta?.runMetadata?.timestamp,
       model: meta?.model,
       headSha: meta?.headSha,
       files: meta?.totalFiles,
-      findings: meta?.summary.totalFindings,
-      bySeverity: meta?.summary.bySeverity,
-      durationMs: meta?.summary.run.durationMs,
-      costUSD: meta?.summary.usage?.costUSD,
+      findings: meta?.summary?.totalFindings,
+      bySeverity: meta?.summary?.bySeverity,
+      durationMs: meta?.summary?.run.durationMs,
+      costUSD: meta?.summary?.usage?.costUSD,
       skills: meta?.skills,
+      inProgress: meta?.inProgress ?? false,
     }));
 
     process.stdout.write(JSON.stringify(results, null, 2) + '\n');
@@ -224,30 +260,49 @@ export async function runLogsList(options: CLIOptions, reporter: Reporter): Prom
       continue;
     }
 
-    const { summary, skills } = meta;
-    totals.findings += summary.totalFindings;
-    totals.durationMs += summary.run.durationMs;
-    if (summary.usage) {
-      totals.costUSD += summary.usage.costUSD;
-    }
-    for (const [sev, count] of Object.entries(summary.bySeverity)) {
-      totals.bySeverity[sev as Severity] += count;
-    }
-    for (const skill of skills) {
-      totals.skills.add(skill);
+    const { summary, runMetadata, skills, inProgress } = meta;
+
+    if (inProgress) {
+      const ts = runMetadata?.timestamp ?? filenameTimestamp(entry);
+      const runId = runMetadata?.runId
+        ? shortRunId(runMetadata.runId)
+        : entry.slice(0, 8);
+      rows.push({
+        runId,
+        date: ts ? formatRelativeTime(new Date(ts)) : '',
+        files: meta.totalFiles > 0 ? String(meta.totalFiles) : '',
+        findings: chalk.yellow('running'),
+        time: '',
+        cost: '',
+        sha: meta.headSha ? meta.headSha.slice(0, 7) : '',
+        model: meta.model ?? '-',
+        skills: skills.join(', '),
+      });
+      for (const skill of skills) totals.skills.add(skill);
+      continue;
     }
 
-    rows.push({
-      runId: shortRunId(summary.run.runId),
-      date: formatRelativeTime(new Date(summary.run.timestamp)),
-      files: meta.totalFiles > 0 ? String(meta.totalFiles) : '',
-      findings: formatSeverityBreakdown(summary.bySeverity),
-      time: formatDuration(summary.run.durationMs),
-      cost: summary.usage ? formatCost(summary.usage.costUSD) : '',
-      sha: meta.headSha ? meta.headSha.slice(0, 7) : '',
-      model: meta.model ?? '-',
-      skills: skills.join(', '),
-    });
+    if (summary) {
+      totals.findings += summary.totalFindings;
+      totals.durationMs += summary.run.durationMs;
+      if (summary.usage) totals.costUSD += summary.usage.costUSD;
+      for (const [sev, count] of Object.entries(summary.bySeverity)) {
+        totals.bySeverity[sev as Severity] += count;
+      }
+      for (const skill of skills) totals.skills.add(skill);
+
+      rows.push({
+        runId: shortRunId(summary.run.runId),
+        date: formatRelativeTime(new Date(summary.run.timestamp)),
+        files: meta.totalFiles > 0 ? String(meta.totalFiles) : '',
+        findings: formatSeverityBreakdown(summary.bySeverity),
+        time: formatDuration(summary.run.durationMs),
+        cost: summary.usage ? formatCost(summary.usage.costUSD) : '',
+        sha: meta.headSha ? meta.headSha.slice(0, 7) : '',
+        model: meta.model ?? '-',
+        skills: skills.join(', '),
+      });
+    }
   }
 
   // Calculate column widths
@@ -301,7 +356,7 @@ export async function runLogsList(options: CLIOptions, reporter: Reporter): Prom
   reporter.blank();
   reporter.text(
     chalk.dim(
-      `${entries.length} ${pluralize(entries.length, 'run')}  ·  ` +
+      `${rows.length} ${pluralize(rows.length, 'run')}  ·  ` +
       `${totals.findings} ${pluralize(totals.findings, 'finding')}  `
     ) +
     formatSeverityBreakdown(totals.bySeverity) +
@@ -312,22 +367,30 @@ export async function runLogsList(options: CLIOptions, reporter: Reporter): Prom
     )
   );
 
+  if (hiddenCount > 0) {
+    reporter.text(
+      chalk.dim(
+        `${hiddenCount} empty ${pluralize(hiddenCount, 'session')} hidden — pass --all to show`,
+      ),
+    );
+  }
+
   return 0;
 }
 
 /**
  * Show results from JSONL log files (replaces `warden replay`).
  */
-export async function runLogsShow(
-  logsOptions: LogsOptions,
+export async function runRunsShow(
+  runsOptions: RunsOptions,
   options: CLIOptions,
   reporter: Reporter,
 ): Promise<number> {
-  const { files: fileArgs } = logsOptions;
+  const { files: fileArgs } = runsOptions;
 
   if (fileArgs.length === 0) {
     reporter.error('No log files specified');
-    reporter.tip('Usage: warden logs show <file.jsonl> [file2.jsonl ...]');
+    reporter.tip('Usage: warden runs show <file.jsonl> [file2.jsonl ...]');
     return 1;
   }
 
@@ -433,7 +496,7 @@ export async function runLogsShow(
 /**
  * Garbage-collect expired log files.
  */
-export async function runLogsGc(options: CLIOptions, reporter: Reporter): Promise<number> {
+export async function runRunsGc(options: CLIOptions, reporter: Reporter): Promise<number> {
   const resolved = resolveLogDir();
   if (!resolved) {
     reporter.error('Not a git repository');
@@ -477,19 +540,225 @@ export async function runLogsGc(options: CLIOptions, reporter: Reporter): Promis
 }
 
 /**
- * Dispatch to the appropriate logs subcommand.
+ * Resolve a follow target. With no arg, picks the newest session whose
+ * file lacks a trailing `summary` record — a reliable proxy for "the
+ * run currently happening in another terminal."
  */
-export async function runLogs(
-  logsOptions: LogsOptions,
+function resolveFollowTarget(arg: string | undefined, logDir: string): string | undefined {
+  if (arg) {
+    if (arg.includes('/') || arg.includes('.')) {
+      const path = resolve(process.cwd(), arg);
+      return existsSync(path) ? path : undefined;
+    }
+    return resolveFileArg(arg, logDir)[0];
+  }
+
+  let entries: string[];
+  try {
+    entries = readdirSync(logDir)
+      .filter((e) => e.endsWith('.jsonl'))
+      .sort()
+      .reverse();
+  } catch {
+    return undefined;
+  }
+  for (const entry of entries) {
+    const filePath = join(logDir, entry);
+    let content: string;
+    try {
+      content = readFileSync(filePath, 'utf-8');
+    } catch {
+      continue;
+    }
+    const lines = content.trim().split('\n').filter((l) => l.trim());
+    const last = lines[lines.length - 1];
+    if (!last) return filePath;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(last);
+    } catch {
+      // Corrupt tail — treating this as in-progress would hang forever.
+      continue;
+    }
+    if ((parsed as { type?: string } | null)?.type !== 'summary') {
+      return filePath;
+    }
+  }
+  return undefined;
+}
+
+/** Render one JSONL line for the human follower. Stops on the summary record. */
+function renderFollowLine(line: string, reporter: Reporter): { stop: boolean } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    reporter.warning(`Skipping malformed line: ${line.slice(0, 80)}`);
+    return { stop: false };
+  }
+
+  const obj = parsed as { type?: string };
+
+  if (obj.type === 'summary') {
+    const summary = JsonlSummaryRecordSchema.safeParse(obj);
+    if (summary.success) {
+      const { totalFindings, bySeverity } = summary.data;
+      reporter.blank();
+      reporter.text(
+        chalk.dim(`Run finished — ${totalFindings} ${pluralize(totalFindings, 'finding')}  `) +
+          formatSeverityBreakdown(bySeverity),
+      );
+    }
+    return { stop: true };
+  }
+
+  if (obj.type === 'fix-evaluation') return { stop: false };
+
+  const skillResult = JsonlRecordSchema.safeParse(obj);
+  if (!skillResult.success) {
+    reporter.warning(`Skipping unrecognized record`);
+    return { stop: false };
+  }
+  const { run: _run, ...report } = skillResult.data;
+  console.log(renderTerminalReport([report], reporter.mode, { verbosity: reporter.verbosity }));
+  return { stop: false };
+}
+
+/** `--json` mode: pass the raw line through unmodified for downstream tools. */
+function passthroughFollowLine(line: string): { stop: boolean } {
+  // One write keeps the line + newline atomic for piped consumers.
+  process.stdout.write(line + '\n');
+  try {
+    const parsed = JSON.parse(line) as { type?: string };
+    if (parsed?.type === 'summary') return { stop: true };
+  } catch {
+    // partial / invalid line; keep waiting for a valid summary
+  }
+  return { stop: false };
+}
+
+/**
+ * Tail a JSONL session file, rendering each appended record live.
+ * Exits 0 on summary record or Ctrl-C — never on findings; this is a
+ * viewer, not a build gate.
+ */
+export async function runRunsFollow(
+  runsOptions: RunsOptions,
   options: CLIOptions,
   reporter: Reporter,
 ): Promise<number> {
-  switch (logsOptions.subcommand) {
+  const resolved = resolveLogDir();
+  if (!resolved) {
+    reporter.error('Not a git repository');
+    return 1;
+  }
+  const { logDir } = resolved;
+
+  const target = resolveFollowTarget(runsOptions.files[0], logDir);
+  if (!target) {
+    if (runsOptions.files[0]) {
+      reporter.error(`No matching session for ${runsOptions.files[0]}`);
+    } else {
+      reporter.error('No active session to follow');
+      reporter.tip('Start a run in another terminal, or pass an explicit run id.');
+    }
+    return 1;
+  }
+
+  if (!options.json) {
+    reporter.dim(`Following: ${target}`);
+    reporter.blank();
+  }
+
+  // Render anything already on disk and remember where we left off.
+  let offset = 0;
+  let buffer = '';
+  let stopped = false;
+
+  const drainFile = (): void => {
+    let fd: number;
+    try {
+      fd = openSync(target, 'r');
+    } catch {
+      return;
+    }
+    try {
+      const stat = fstatSync(fd);
+      if (stat.size <= offset) return;
+      const len = stat.size - offset;
+      const buf = Buffer.alloc(len);
+      readSync(fd, buf, 0, len, offset);
+      offset = stat.size;
+      buffer += buf.toString('utf-8');
+      let nl: number;
+      while ((nl = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        if (!line.trim()) continue;
+        const result = options.json
+          ? passthroughFollowLine(line)
+          : renderFollowLine(line, reporter);
+        if (result.stop) {
+          stopped = true;
+          return;
+        }
+      }
+    } finally {
+      try { closeSync(fd); } catch { /* ignore */ }
+    }
+  };
+
+  drainFile();
+  if (stopped) return 0;
+
+  return new Promise<number>((resolvePromise) => {
+    let watcher: ReturnType<typeof watch> | undefined;
+
+    const tick = () => {
+      drainFile();
+      if (stopped) finish(0);
+    };
+
+    // fs.watch is best-effort across platforms; the 1s poll below is the
+    // real correctness guarantee.
+    try {
+      watcher = watch(target, { persistent: true }, () => tick());
+      // FSWatcher 'error' would crash the process otherwise (file deleted, inotify limit, ...).
+      watcher.on('error', () => {
+        try { watcher?.close(); } catch { /* ignore */ }
+        watcher = undefined;
+      });
+    } catch { /* polling alone is fine */ }
+    const pollTimer = setInterval(tick, 1000);
+
+    const finish = (code: number) => {
+      if (watcher) {
+        try { watcher.close(); } catch { /* ignore */ }
+      }
+      clearInterval(pollTimer);
+      process.off('SIGINT', onSigint);
+      resolvePromise(code);
+    };
+
+    const onSigint = () => finish(0);
+    process.on('SIGINT', onSigint);
+  });
+}
+
+/** Dispatch to the appropriate `runs` subcommand. */
+export async function runRuns(
+  runsOptions: RunsOptions,
+  options: CLIOptions,
+  reporter: Reporter,
+): Promise<number> {
+  switch (runsOptions.subcommand) {
     case 'list':
-      return runLogsList(options, reporter);
+      return runRunsList(options, reporter, { all: runsOptions.all });
     case 'show':
-      return runLogsShow(logsOptions, options, reporter);
+      return runRunsShow(runsOptions, options, reporter);
     case 'gc':
-      return runLogsGc(options, reporter);
+      return runRunsGc(options, reporter);
+    case 'follow':
+      return runRunsFollow(runsOptions, options, reporter);
   }
 }
