@@ -120,6 +120,7 @@ function mergeDefaults(base?: Defaults, overlay?: Defaults): Defaults | undefine
     agent: mergeNestedConfig(base.agent, overlay.agent),
     auxiliary: mergeNestedConfig(base.auxiliary, overlay.auxiliary),
     synthesis: mergeNestedConfig(base.synthesis, overlay.synthesis),
+    verification: mergeNestedConfig(base.verification, overlay.verification),
     ignorePaths: mergeArray(base.ignorePaths, overlay.ignorePaths),
     chunking: mergeChunkingConfig(base.chunking, overlay.chunking),
   };
@@ -141,6 +142,21 @@ function mergeLogsConfig(
   if (!base) return overlay;
   if (!overlay) return base;
   return { ...base, ...overlay };
+}
+
+function inheritRepoLayerDefaults(base?: Defaults, repo?: Defaults): Defaults | undefined {
+  const inherited: Defaults = { ...(repo ?? {}) };
+
+  if (base?.runtime !== undefined && inherited.runtime === undefined) {
+    inherited.runtime = base.runtime;
+  }
+
+  const verification = mergeNestedConfig(base?.verification, repo?.verification);
+  if (verification) {
+    inherited.verification = verification;
+  }
+
+  return Object.keys(inherited).length > 0 ? inherited : undefined;
 }
 
 export function mergeWardenConfigs(base: WardenConfig, overlay: WardenConfig): WardenConfig {
@@ -298,6 +314,8 @@ export interface ResolvedTrigger {
   synthesisModel?: string;
   /** Max retries for auxiliary structured model calls. */
   auxiliaryMaxRetries?: number;
+  /** Whether candidate findings should be verified in a second pass. */
+  verifyFindings?: boolean;
   /** Minimum confidence for findings (merged: trigger > skill > defaults) */
   minConfidence?: ConfidenceThreshold;
   /** Batch delay to use for this trigger's skill execution */
@@ -347,6 +365,7 @@ export function resolveSkillConfigs(
   const auxiliaryMaxRetries =
     defaults?.auxiliary?.maxRetries ??
     defaults?.auxiliaryMaxRetries;
+  const verifyFindings = defaults?.verification?.enabled !== false;
 
   for (const skill of config.skills) {
     const baseModel =
@@ -389,6 +408,7 @@ export function resolveSkillConfigs(
         auxiliaryModel,
         synthesisModel,
         auxiliaryMaxRetries,
+        verifyFindings,
         minConfidence: skill.minConfidence ?? defaults?.minConfidence,
         batchDelayMs: defaults?.batchDelayMs,
         maxContextFiles: defaults?.chunking?.maxContextFiles,
@@ -416,6 +436,7 @@ export function resolveSkillConfigs(
           auxiliaryModel,
           synthesisModel,
           auxiliaryMaxRetries,
+          verifyFindings,
           minConfidence: trigger.minConfidence ?? skill.minConfidence ?? defaults?.minConfidence,
           batchDelayMs: defaults?.batchDelayMs,
           maxContextFiles: defaults?.chunking?.maxContextFiles,
@@ -434,21 +455,14 @@ export function resolveLayeredSkillConfigs(
   skillRootsByName?: LayeredSkillRootsByName
 ): ResolvedTrigger[] {
   if (layered.baseConfig && layered.repoConfig) {
-    const repoConfigWithInheritedRuntime: WardenConfig =
-      layered.baseConfig.defaults?.runtime !== undefined &&
-      layered.repoConfig.defaults?.runtime === undefined
-        ? {
-            ...layered.repoConfig,
-            defaults: {
-              ...layered.repoConfig.defaults,
-              runtime: layered.baseConfig.defaults.runtime,
-            },
-          }
-        : layered.repoConfig;
+    const repoConfigWithInheritedDefaults: WardenConfig = {
+      ...layered.repoConfig,
+      defaults: inheritRepoLayerDefaults(layered.baseConfig.defaults, layered.repoConfig.defaults),
+    };
 
     return [
       ...resolveSkillConfigs(layered.baseConfig, cliModel, skillRootsByName?.base),
-      ...resolveSkillConfigs(repoConfigWithInheritedRuntime, cliModel, skillRootsByName?.repo),
+      ...resolveSkillConfigs(repoConfigWithInheritedDefaults, cliModel, skillRootsByName?.repo),
     ];
   }
 

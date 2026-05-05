@@ -10,7 +10,6 @@ import type { SkillDefinition } from '../../config/schema.js';
 import { Semaphore, runPool } from '../../utils/index.js';
 import { SkillRunnerError, WardenAuthenticationError } from '../../sdk/errors.js';
 import * as sdkRunner from '../../sdk/runner.js';
-import * as fixQuality from '../../sdk/fix-quality.js';
 
 function makeFinding(overrides: Partial<Finding> = {}): Finding {
   return {
@@ -58,7 +57,7 @@ describe('createDefaultCallbacks', () => {
   });
 
   afterEach(() => {
-    errorSpy.mockRestore();
+    vi.restoreAllMocks();
   });
 
   describe('onSkillStart', () => {
@@ -486,6 +485,42 @@ describe('createDefaultCallbacks', () => {
       const cb = createDefaultCallbacks(tasks, logMode(), Verbosity.Normal);
       expect(cb.onExtractionResult).toBeUndefined();
     });
+
+    it('onFindingProcessing is defined at Debug verbosity', () => {
+      const tasks = [makeTask('t', 's')];
+      const cb = createDefaultCallbacks(tasks, logMode(), Verbosity.Debug);
+      expect(cb.onFindingProcessing).toBeDefined();
+    });
+
+    it('onFindingProcessing is undefined below Debug verbosity', () => {
+      const tasks = [makeTask('t', 's')];
+      const cb = createDefaultCallbacks(tasks, logMode(), Verbosity.Normal);
+      expect(cb.onFindingProcessing).toBeUndefined();
+    });
+
+    it('logs finding processing events in debug mode', () => {
+      const tasks = [makeTask('t', 's')];
+      const cb = createDefaultCallbacks(tasks, logMode(), Verbosity.Debug);
+
+      cb.onFindingProcessing!('t', {
+        stage: 'verification',
+        action: 'rejected',
+        finding: {
+          id: 'f1',
+          severity: 'high',
+          title: 'Candidate',
+          description: 'desc',
+          location: { path: 'src/app.ts', startLine: 10 },
+        },
+        reason: 'guarded upstream',
+      });
+
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      const msg = errorSpy.mock.calls[0]![0] as string;
+      expect(msg).toContain('DEBUG: verification:rejected');
+      expect(msg).toContain('src/app.ts:10');
+      expect(msg).toContain('guarded upstream');
+    });
   });
 
   describe('onHunkFailed', () => {
@@ -648,6 +683,104 @@ describe('runSkillTasks', () => {
 
     expect(results).toHaveLength(0);
     expect(resolveSkill).not.toHaveBeenCalled();
+  });
+
+  it('does not fail-fast on findings rejected by post-processing', async () => {
+    const candidate = makeFinding();
+    const controller = new AbortController();
+    const fakeHunk = {
+      hunk: { newStart: 1, newCount: 10 },
+    } as unknown as HunkWithContext;
+
+    const prepareFiles = vi.spyOn(sdkRunner, 'prepareFiles').mockReturnValue({
+      files: [{ filename: 'a.ts', hunks: [fakeHunk] }],
+      skippedFiles: [],
+    });
+    const analyzeFile = vi.spyOn(sdkRunner, 'analyzeFile').mockResolvedValue({
+      filename: 'a.ts',
+      findings: [candidate],
+      usage: { inputTokens: 1, outputTokens: 1, costUSD: 0.001 },
+      failedHunks: 0,
+      failedExtractions: 0,
+      hunkFailures: [],
+    } satisfies FileAnalysisResult);
+    const postProcessFindings = vi.spyOn(sdkRunner, 'postProcessFindings').mockResolvedValue({
+      findings: [],
+      auxiliaryUsage: [],
+    });
+
+    const results = await runSkillTasks([{
+      name: 'verify-skill',
+      resolveSkill: async () =>
+        ({ name: 'verify-skill', definition: '', files: [] } as unknown as SkillDefinition),
+      context: {
+        eventType: 'pull_request',
+        repository: { owner: 'o', name: 'n', fullName: 'o/n', defaultBranch: 'main' },
+        repoPath: '/tmp',
+        pullRequest: { number: 1, title: 't', body: '', headSha: 'abc', baseSha: 'def', files: [] },
+      } as unknown as SkillTaskOptions['context'],
+    }], {
+      mode: logMode(),
+      verbosity: Verbosity.Quiet,
+      concurrency: 1,
+      failFastController: controller,
+    });
+
+    expect(results[0]?.report?.findings).toEqual([]);
+    expect(controller.signal.aborted).toBe(false);
+    expect(postProcessFindings).toHaveBeenCalled();
+
+    prepareFiles.mockRestore();
+    analyzeFile.mockRestore();
+    postProcessFindings.mockRestore();
+  });
+
+  it('fail-fast aborts after final findings are post-processed', async () => {
+    const finalFinding = makeFinding();
+    const controller = new AbortController();
+    const fakeHunk = {
+      hunk: { newStart: 1, newCount: 10 },
+    } as unknown as HunkWithContext;
+
+    const prepareFiles = vi.spyOn(sdkRunner, 'prepareFiles').mockReturnValue({
+      files: [{ filename: 'a.ts', hunks: [fakeHunk] }],
+      skippedFiles: [],
+    });
+    const analyzeFile = vi.spyOn(sdkRunner, 'analyzeFile').mockResolvedValue({
+      filename: 'a.ts',
+      findings: [finalFinding],
+      usage: { inputTokens: 1, outputTokens: 1, costUSD: 0.001 },
+      failedHunks: 0,
+      failedExtractions: 0,
+      hunkFailures: [],
+    } satisfies FileAnalysisResult);
+    const postProcessFindings = vi.spyOn(sdkRunner, 'postProcessFindings').mockResolvedValue({
+      findings: [finalFinding],
+      auxiliaryUsage: [],
+    });
+
+    await runSkillTasks([{
+      name: 'verify-skill',
+      resolveSkill: async () =>
+        ({ name: 'verify-skill', definition: '', files: [] } as unknown as SkillDefinition),
+      context: {
+        eventType: 'pull_request',
+        repository: { owner: 'o', name: 'n', fullName: 'o/n', defaultBranch: 'main' },
+        repoPath: '/tmp',
+        pullRequest: { number: 1, title: 't', body: '', headSha: 'abc', baseSha: 'def', files: [] },
+      } as unknown as SkillTaskOptions['context'],
+    }], {
+      mode: logMode(),
+      verbosity: Verbosity.Quiet,
+      concurrency: 1,
+      failFastController: controller,
+    });
+
+    expect(controller.signal.aborted).toBe(true);
+
+    prepareFiles.mockRestore();
+    analyzeFile.mockRestore();
+    postProcessFindings.mockRestore();
   });
 });
 
@@ -893,7 +1026,7 @@ describe('runSkillTask model lanes', () => {
     vi.restoreAllMocks();
   });
 
-  it('uses synthesisModel for consolidation and auxiliaryModel for auxiliary gates', async () => {
+  it('passes model lanes to shared finding post-processing', async () => {
     const fakeHunk = {
       hunk: { newStart: 1, newCount: 10 },
     } as unknown as HunkWithContext;
@@ -911,18 +1044,9 @@ describe('runSkillTask model lanes', () => {
       failedExtractions: 0,
       hunkFailures: [],
     } satisfies FileAnalysisResult);
-    const mergeSpy = vi.spyOn(sdkRunner, 'mergeCrossLocationFindings').mockResolvedValue({
+    const postProcessSpy = vi.spyOn(sdkRunner, 'postProcessFindings').mockResolvedValue({
       findings: [finding],
-      mergedCount: 0,
-    });
-    const sanitizeSpy = vi.spyOn(fixQuality, 'sanitizeFindingsSuggestedFixes').mockResolvedValue({
-      findings: [finding],
-      stats: {
-        checked: 0,
-        strippedDeterministic: 0,
-        strippedSemantic: 0,
-        semanticUnavailable: 0,
-      },
+      auxiliaryUsage: [],
     });
 
     const result = await runSkillTask({
@@ -942,13 +1066,12 @@ describe('runSkillTask model lanes', () => {
     }, 1, noopCallbacks());
 
     expect(result.report?.error).toBeUndefined();
-    expect(mergeSpy).toHaveBeenCalledWith(
+    expect(postProcessSpy).toHaveBeenCalledWith(
       expect.any(Array),
-      expect.objectContaining({ model: 'claude-opus-4-5' })
-    );
-    expect(sanitizeSpy).toHaveBeenCalledWith(
-      expect.any(Array),
-      expect.objectContaining({ model: 'claude-haiku-4-5' })
+      expect.objectContaining({
+        auxiliaryModel: 'claude-haiku-4-5',
+        synthesisModel: 'claude-opus-4-5',
+      })
     );
   });
 });

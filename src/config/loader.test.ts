@@ -432,6 +432,21 @@ describe('resolveSkillConfigs', () => {
       expect(resolved?.auxiliaryMaxRetries).toBe(2);
     });
 
+    it('enables finding verification by default and allows disabling it', () => {
+      const [defaultResolved] = resolveSkillConfigs(baseConfig);
+      expect(defaultResolved?.verifyFindings).toBe(true);
+
+      const config: WardenConfig = {
+        ...baseConfig,
+        defaults: {
+          verification: { enabled: false },
+        },
+      };
+
+      const [resolved] = resolveSkillConfigs(config);
+      expect(resolved?.verifyFindings).toBe(false);
+    });
+
     it('falls back to auxiliary model when synthesis model is unset', () => {
       const config: WardenConfig = {
         ...baseConfig,
@@ -776,6 +791,47 @@ describe('resolveLayeredSkillConfigs', () => {
     expect(resolved[1]?.runtime).toBe('pi');
   });
 
+  it('lets repo-defined skills inherit base verification defaults when omitted', () => {
+    const baseConfig: WardenConfig = {
+      version: 1,
+      defaults: {
+        failOn: 'high',
+        model: 'base-model',
+        ignorePaths: ['base/**'],
+        runtime: 'claude',
+        verification: { enabled: false },
+        chunking: { maxContextFiles: 25 },
+      },
+      skills: [{
+        name: 'org-skill',
+        triggers: [{ type: 'pull_request', actions: ['opened'] }],
+      }],
+    };
+
+    const repoConfig: WardenConfig = {
+      version: 1,
+      skills: [{
+        name: 'repo-skill',
+        triggers: [{ type: 'pull_request', actions: ['opened'] }],
+      }],
+    };
+
+    const resolved = resolveLayeredSkillConfigs({
+      config: { version: 1, skills: [] },
+      baseConfig,
+      repoConfig,
+    });
+
+    expect(resolved).toHaveLength(2);
+    expect(resolved[0]?.verifyFindings).toBe(false);
+    expect(resolved[1]?.verifyFindings).toBe(false);
+    expect(resolved[1]?.runtime).toBe('claude');
+    expect(resolved[1]?.failOn).toBeUndefined();
+    expect(resolved[1]?.model).toBeUndefined();
+    expect(resolved[1]?.filters.ignorePaths).toBeUndefined();
+    expect(resolved[1]?.maxContextFiles).toBeUndefined();
+  });
+
   it('uses layer-specific skill roots when both layers define the same skill name', () => {
     const baseConfig: WardenConfig = {
       version: 1,
@@ -851,6 +907,20 @@ describe('maxTurns config', () => {
     expect(result.data?.defaults?.runtime).toBe('claude');
     expect(result.data?.defaults?.auxiliary?.model).toBe('claude-haiku-4-5');
     expect(result.data?.defaults?.synthesis?.model).toBe('claude-opus-4-5');
+  });
+
+  it('accepts verification defaults', () => {
+    const config = {
+      version: 1,
+      defaults: {
+        verification: { enabled: false },
+      },
+      skills: [],
+    };
+
+    const result = WardenConfigSchema.safeParse(config);
+    expect(result.success).toBe(true);
+    expect(result.data?.defaults?.verification?.enabled).toBe(false);
   });
 
   it('rejects unknown runtimes', () => {
