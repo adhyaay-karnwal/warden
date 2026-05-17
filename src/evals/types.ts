@@ -1,9 +1,14 @@
 import { z } from 'zod';
+import { RuntimeNameSchema } from '../sdk/runtimes/types.js';
 import { SeveritySchema } from '../types/index.js';
-import type { Finding, SkillReport, UsageStats } from '../types/index.js';
+import type { Finding } from '../types/index.js';
+import type { RuntimeName } from '../sdk/runtimes/types.js';
 
 /** Default model for eval skill execution and judging. */
 export const DEFAULT_EVAL_MODEL = 'claude-sonnet-4-6';
+
+/** Default runtime for eval skill execution. */
+export const DEFAULT_EVAL_RUNTIME: RuntimeName = 'claude';
 
 /**
  * A "should find" assertion in BDD style.
@@ -19,7 +24,19 @@ export const ShouldFindSchema = z.object({
 export type ShouldFind = z.infer<typeof ShouldFindSchema>;
 
 /**
- * A single eval scenario within a YAML eval file.
+ * Maintainer-only provenance for standalone evals. Runners ignore this field.
+ */
+export const EvalScenarioNotesSchema = z.object({
+  /** Original PR, issue, benchmark, or other source URL. */
+  source: z.string().optional(),
+  /** Which source side was captured when scaffolded from a PR. */
+  side: z.string().optional(),
+  /** Optional copied source notes, such as a PR body. */
+  body: z.string().optional(),
+}).passthrough();
+
+/**
+ * A single eval scenario within a YAML eval file or standalone JSON file.
  */
 export const EvalScenarioSchema = z.object({
   /** Scenario name (e.g., "null-property-access") */
@@ -30,12 +47,25 @@ export const EvalScenarioSchema = z.object({
   files: z.array(z.string()).min(1),
   /** Model override for this specific scenario */
   model: z.string().optional(),
+  /** Runtime override for this specific scenario */
+  runtime: RuntimeNameSchema.optional(),
   /** What Warden should find (BDD "then") */
   should_find: z.array(ShouldFindSchema).min(1),
   /** What Warden should NOT report (precision assertions) */
   should_not_find: z.array(z.string()).default([]),
+  /** Optional maintainer-only provenance, ignored by eval execution */
+  notes: EvalScenarioNotesSchema.optional(),
 });
 export type EvalScenario = z.infer<typeof EvalScenarioSchema>;
+
+/**
+ * A standalone eval scenario file. The scenario name defaults to the file
+ * basename so adding cases does not require repeating it in JSON.
+ */
+export const EvalScenarioFileSchema = EvalScenarioSchema.extend({
+  name: z.string().optional(),
+});
+export type EvalScenarioFile = z.infer<typeof EvalScenarioFileSchema>;
 
 /**
  * Root schema for a YAML eval file. Each file defines a category of evals
@@ -54,6 +84,8 @@ export type EvalScenario = z.infer<typeof EvalScenarioSchema>;
 export const EvalFileSchema = z.object({
   /** Skill to run, relative to evals/ directory */
   skill: z.string(),
+  /** Default runtime for all evals in this file */
+  runtime: RuntimeNameSchema.default(DEFAULT_EVAL_RUNTIME),
   /** Default model for all evals in this file */
   model: z.string().default(DEFAULT_EVAL_MODEL),
   /** List of eval scenarios */
@@ -68,8 +100,10 @@ export type EvalFile = z.infer<typeof EvalFileSchema>;
 export interface EvalMeta {
   /** Scenario name (e.g., "null-property-access") */
   name: string;
-  /** Category name from the YAML filename (e.g., "bug-detection") */
+  /** Category name from the YAML filename (e.g., "eval-bug-detection") */
   category: string;
+  /** Resolved skill name from the skill frontmatter or file path */
+  skillName: string;
   /** What this eval tests (BDD "given") */
   given: string;
   /** Resolved absolute path to the skill file */
@@ -78,6 +112,8 @@ export interface EvalMeta {
   filePaths: string[];
   /** Model to use for skill execution */
   model: string;
+  /** Runtime to use for skill execution */
+  runtime: RuntimeName;
   /** What Warden should find */
   should_find: ShouldFind[];
   /** What Warden should NOT report */
@@ -120,30 +156,6 @@ export const JudgeResponseSchema = z.object({
 export type JudgeResponse = z.infer<typeof JudgeResponseSchema>;
 
 /**
- * Result of running a single eval scenario.
- */
-export interface EvalResult {
-  /** Display name (e.g., "bug-detection/null-property-access") */
-  name: string;
-  /** Eval metadata */
-  meta: EvalMeta;
-  /** Whether the eval passed overall */
-  passed: boolean;
-  /** Skill report from the agent run */
-  report: SkillReport;
-  /** Judge response with per-expectation verdicts */
-  judgeResponse: JudgeResponse;
-  /** Verbose logs from the agent run */
-  logs: string[];
-  /** Total duration of the eval (agent + judge) in ms */
-  durationMs: number;
-  /** Usage from the skill run */
-  skillUsage?: UsageStats;
-  /** Usage from the judge call */
-  judgeUsage?: UsageStats;
-}
-
-/**
  * Determine if an eval passed based on judge response and eval metadata.
  */
 export function evalPassed(
@@ -177,45 +189,4 @@ export function evalPassed(
   }
 
   return true;
-}
-
-/**
- * Format an eval result for human-readable output.
- */
-export function formatEvalResult(result: EvalResult): string {
-  const status = result.passed ? 'PASS' : 'FAIL';
-  const lines: string[] = [];
-
-  lines.push(`[${status}] ${result.name}`);
-  lines.push(`  Given: ${result.meta.given}`);
-  lines.push(`  Findings: ${result.report.findings.length}`);
-
-  for (let i = 0; i < result.meta.should_find.length; i++) {
-    const assertion = result.meta.should_find[i];
-    const verdict = result.judgeResponse.expectations[i];
-    const mark = verdict?.met ? 'PASS' : 'FAIL';
-    const req = assertion?.required ? '' : ' (optional)';
-    lines.push(`  [${mark}] should find: ${assertion?.finding ?? 'unknown'}${req}`);
-    if (verdict?.reasoning) {
-      lines.push(`    -> ${verdict.reasoning}`);
-    }
-    if (assertion?.severity && verdict?.met && verdict.matchedFindingIndex !== null) {
-      const matchedSeverity = result.report.findings[verdict.matchedFindingIndex]?.severity ?? 'missing';
-      if (matchedSeverity !== assertion.severity) {
-        lines.push(`    -> severity mismatch: expected ${assertion.severity}, got ${matchedSeverity}`);
-      }
-    }
-  }
-
-  for (let i = 0; i < result.meta.should_not_find.length; i++) {
-    const assertion = result.meta.should_not_find[i];
-    const verdict = result.judgeResponse.antiExpectations[i];
-    const mark = verdict?.violated ? 'FAIL' : 'PASS';
-    lines.push(`  [${mark}] should not find: ${assertion ?? 'unknown'}`);
-    if (verdict?.reasoning) {
-      lines.push(`    -> ${verdict.reasoning}`);
-    }
-  }
-
-  return lines.join('\n');
 }

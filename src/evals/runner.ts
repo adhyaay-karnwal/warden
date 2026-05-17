@@ -5,30 +5,45 @@ import { execGitNonInteractive } from '../utils/exec.js';
 import { buildLocalEventContext } from '../cli/context.js';
 import { resolveSkillAsync } from '../skills/loader.js';
 import { runSkill } from '../sdk/runner.js';
-import { runJudge } from './judge.js';
-import { evalPassed } from './types.js';
-import type { EvalMeta, EvalResult } from './types.js';
-import type { Finding } from '../types/index.js';
+import { formatEvalId } from './names.js';
+import type { EvalMeta } from './types.js';
+import type { Finding, SkillReport } from '../types/index.js';
 import type { FindingProcessingEvent } from '../sdk/runner.js';
+import type { RuntimeName } from '../sdk/runtimes/types.js';
 
 export interface RunEvalOptions {
   /** Anthropic API key */
   apiKey: string;
   /** Override the model from the YAML spec */
   model?: string;
+  /** Override the runtime from the YAML spec */
+  runtime?: RuntimeName;
   /** Enable verbose logging */
   verbose?: boolean;
+}
+
+export interface EvalSkillRunResult {
+  /** Display name (e.g. "code-review/case") */
+  name: string;
+  /** Eval metadata */
+  meta: EvalMeta;
+  /** Skill report from the agent run */
+  report: SkillReport;
+  /** Verbose logs from the agent run */
+  logs: string[];
+  /** Duration of the skill run in ms */
+  durationMs: number;
 }
 
 /**
  * Set up a temporary git repository for an eval scenario.
  *
- * Creates a real git repo with an empty `main` commit (the base) and an
- * `eval` branch containing fixture files + the skill definition. This gives
+ * Creates a real git repo with a `main` commit containing the skill definition
+ * and an `eval` branch containing only fixture files. This gives
  * the agent a real git environment to explore with Read/Grep and produces
  * real git diffs for the pipeline to parse.
  */
-function setupEvalRepo(meta: EvalMeta, log: (msg: string) => void): string {
+export function setupEvalRepo(meta: EvalMeta, log: (msg: string) => void): string {
   const tmpDir = mkdtempSync(join(tmpdir(), `warden-eval-${meta.name}-`));
 
   try {
@@ -37,19 +52,11 @@ function setupEvalRepo(meta: EvalMeta, log: (msg: string) => void): string {
     git(['init', '--initial-branch=main']);
     git(['config', 'user.email', 'eval@warden.dev']);
     git(['config', 'user.name', 'Warden Eval']);
-    git(['commit', '--allow-empty', '-m', 'initial commit']);
-    git(['checkout', '-b', 'eval']);
-
-    // Copy fixture files, preserving their parent directory name
-    for (const srcPath of meta.filePaths) {
-      const destDir = join(tmpDir, basename(dirname(srcPath)));
-      mkdirSync(destDir, { recursive: true });
-      copyFileSync(srcPath, join(destDir, basename(srcPath)));
-    }
 
     // Copy skill into repo. If it lives in a directory (skill-name/SKILL.md),
     // copy the whole directory to preserve resource subdirs (scripts/, references/).
-    // For flat .md files, just copy the single file.
+    // For flat .md files, just copy the single file. Commit it on main so eval
+    // diffs contain only fixture code, not the skill used to run the eval.
     const skillSrcDir = dirname(meta.skillPath);
     const skillMarker = join(skillSrcDir, 'SKILL.md');
     const skillDestDir = join(tmpDir, '.warden', 'skills');
@@ -61,6 +68,17 @@ function setupEvalRepo(meta: EvalMeta, log: (msg: string) => void): string {
       cpSync(skillSrcDir, join(skillDestDir, skillDirName), { recursive: true });
     } else {
       copyFileSync(meta.skillPath, join(skillDestDir, basename(meta.skillPath)));
+    }
+
+    git(['add', '.']);
+    git(['commit', '-m', 'install eval skill']);
+    git(['checkout', '-b', 'eval']);
+
+    // Copy fixture files, preserving their parent directory name
+    for (const srcPath of meta.filePaths) {
+      const destDir = join(tmpDir, basename(dirname(srcPath)));
+      mkdirSync(destDir, { recursive: true });
+      copyFileSync(srcPath, join(destDir, basename(srcPath)));
     }
 
     git(['add', '.']);
@@ -87,18 +105,18 @@ function formatFindingProcessingEvent(event: FindingProcessingEvent): string {
 }
 
 /**
- * Run a single eval scenario end-to-end.
+ * Run a single eval scenario through Warden's skill pipeline.
  *
  * The only thing mocked is the GitHub event payload (no real PR).
  * Everything else runs for real: git repo, diff parsing, SDK invocation,
- * agent with Read/Grep tools, finding extraction, LLM judge.
+ * agent with Read/Grep tools, and finding extraction.
  */
-export async function runEval(
+export async function runEvalSkill(
   meta: EvalMeta,
   options: RunEvalOptions
-): Promise<EvalResult> {
+): Promise<EvalSkillRunResult> {
   const startTime = Date.now();
-  const name = `${meta.category}/${meta.name}`;
+  const name = formatEvalId(meta);
   const logs: string[] = [];
 
   const log = (msg: string): void => {
@@ -136,11 +154,13 @@ export async function runEval(
     log(`Skill resolved: ${skill.name}`);
 
     const model = options.model ?? meta.model;
-    log(`Running skill with model: ${model}`);
+    const runtime = options.runtime ?? meta.runtime;
+    log(`Running skill with model: ${model} [${runtime}]`);
 
     const report = await runSkill(skill, context, {
       apiKey: options.apiKey,
       model,
+      runtime,
       verbose: options.verbose,
       parallel: false,
       callbacks: options.verbose
@@ -158,22 +178,12 @@ export async function runEval(
       log(`  [${finding.severity}] ${finding.title}${loc}`);
     }
 
-    log('Running judge...');
-    const judgeResult = await runJudge(meta, report.findings, options.apiKey);
-
-    const passed = evalPassed(meta, judgeResult.response, report.findings);
-    log(`Result: ${passed ? 'PASS' : 'FAIL'}`);
-
     return {
       name,
       meta,
-      passed,
       report,
-      judgeResponse: judgeResult.response,
       logs,
       durationMs: Date.now() - startTime,
-      skillUsage: report.usage,
-      judgeUsage: judgeResult.usage,
     };
   } finally {
     if (repoDir) {

@@ -42,7 +42,10 @@ src/                   # @sentry/warden core (root package)
 └── examples/          # Example configurations
 
 evals/                 # Eval specs, fixtures, and test skills (see evals/README.md)
-├── *.yaml             # YAML eval definitions
+├── eval-*.yaml        # Harness smoke suites using eval-* test skills
+├── code-review/       # Code-review benchmark scenarios
+├── security-review/   # Security-review benchmark scenarios
+├── verification/      # Verifier-only eval scenarios
 ├── skills/            # Test skills used as eval vehicles
 └── fixtures/          # Source code with known issues
 ```
@@ -129,7 +132,7 @@ Skills define **what to look for**, not how to respond to findings:
 
 ## Evals
 
-End-to-end behavioral tests for the full pipeline. See [`evals/README.md`](evals/README.md) for the YAML spec, how to add evals, and how it all works. Run with `pnpm test:evals`.
+End-to-end evals for the full pipeline plus verifier-only evals. The Vitest entrypoints are split as `src/evals/e2e.eval.ts`, `src/evals/code-review.eval.ts`, `src/evals/security-review.eval.ts`, and `src/evals/verify.eval.ts`. See [`evals/INTERNAL.md`](evals/INTERNAL.md) for maintainer workflow and [`evals/README.md`](evals/README.md) for schemas. Run with `pnpm evals`; scaffold PR fixtures with `pnpm evals:scaffold <github-pr-url>`.
 
 ## Voice
 
