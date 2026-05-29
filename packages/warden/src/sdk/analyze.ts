@@ -335,7 +335,7 @@ async function analyzeHunk(
           // Check for authentication errors from auth_status messages
           // auth_status errors are always auth-related - throw immediately
           if (authError) {
-            throw new WardenAuthenticationError(authError);
+            throw new WardenAuthenticationError(authError, { runtime: runtimeName });
           }
 
           if (!resultMessage) {
@@ -365,7 +365,7 @@ async function analyzeHunk(
             // Check if any error indicates authentication failure
             for (const err of errorMessages) {
               if (isAuthenticationErrorMessage(err)) {
-                throw new WardenAuthenticationError();
+                throw new WardenAuthenticationError(undefined, { runtime: runtimeName });
               }
             }
 
@@ -489,7 +489,7 @@ async function analyzeHunk(
           if (isAuthenticationError(error)) {
             const errorMessage = error instanceof Error ? error.message : String(error);
             options.circuitBreaker?.recordFailure('auth_failed', sanitizeErrorMessage(errorMessage));
-            throw new WardenAuthenticationError(undefined, { cause: error });
+            throw new WardenAuthenticationError(undefined, { runtime: options.runtime ?? 'pi', cause: error });
           }
 
           // Don't retry if not a retryable error or we've exhausted retries

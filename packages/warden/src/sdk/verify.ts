@@ -180,21 +180,22 @@ function applyVerdict(finding: Finding, verdict: VerificationVerdict | null): Fi
 
 function throwIfAuthenticationFailure(
   authError: string | undefined,
-  result: SkillRunResult | undefined
+  result: SkillRunResult | undefined,
+  runtime?: string
 ): void {
   if (authError) {
-    throw new WardenAuthenticationError(authError);
+    throw new WardenAuthenticationError(authError, { runtime });
   }
 
   if (!result) return;
 
   const authMessage = result.errors.find(isAuthenticationErrorMessage);
   if (result.status === 'auth_error') {
-    throw new WardenAuthenticationError(authMessage);
+    throw new WardenAuthenticationError(authMessage, { runtime });
   }
 
   if (authMessage) {
-    throw new WardenAuthenticationError(authMessage);
+    throw new WardenAuthenticationError(authMessage, { runtime });
   }
 }
 
@@ -275,7 +276,7 @@ export async function verifyFindings(
           }),
         });
 
-        throwIfAuthenticationFailure(authError, result);
+        throwIfAuthenticationFailure(authError, result, runtimeName);
 
         const verdict = result?.status === 'success'
           ? parseVerificationVerdict(result.text)
@@ -302,7 +303,7 @@ export async function verifyFindings(
         }
 
         if (isAuthenticationError(error)) {
-          throw new WardenAuthenticationError(undefined, { cause: error });
+          throw new WardenAuthenticationError(undefined, { runtime: runtimeName, cause: error });
         }
 
         return { finding };
