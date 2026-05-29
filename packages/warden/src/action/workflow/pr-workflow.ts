@@ -28,7 +28,8 @@ import { filterFindings } from '../../types/index.js';
 import type { EventContext, SkillReport, Finding } from '../../types/index.js';
 import { runPool, Semaphore } from '../../utils/index.js';
 import { evaluateFixAttempts, postThreadReply } from '../fix-evaluation/index.js';
-import type { FixEvaluation } from '../fix-evaluation/index.js';
+import type { EvaluateFixAttemptsResult, FixEvaluation } from '../fix-evaluation/index.js';
+import { aggregateUsage } from '../../sdk/usage.js';
 import { logAction, warnAction } from '../../cli/output/tty.js';
 import { formatCost, formatTokens, formatDuration } from '../../cli/output/formatters.js';
 import { findBotReviewState } from '../review-state.js';
@@ -93,6 +94,12 @@ interface ReviewPhaseResult {
   findingObservations: FindingObservation[];
   shouldFailAction: boolean;
   failureReasons: string[];
+}
+
+interface FixEvaluationCommentGroups {
+  groups: Map<string, ExistingComment[]>;
+  currentHeadCount: number;
+  missingOriginalCommitCount: number;
 }
 
 interface AuxiliaryWorkflowOptions {
@@ -185,6 +192,53 @@ function logFixEvaluation(ev: FixEvaluation, index: number, total: number): void
   if (ev.verdict === 'attempted_failed' && ev.reasoning) {
     logAction(`        reason: "${ev.reasoning}"`);
   }
+}
+
+function groupCommentsForFixEvaluation(
+  comments: ExistingComment[],
+  headSha: string
+): FixEvaluationCommentGroups {
+  const groups = new Map<string, ExistingComment[]>();
+  let currentHeadCount = 0;
+  let missingOriginalCommitCount = 0;
+
+  for (const comment of comments) {
+    const originalCommitSha = comment.originalCommitSha;
+    if (!originalCommitSha) {
+      missingOriginalCommitCount++;
+      continue;
+    }
+    if (originalCommitSha === headSha) {
+      currentHeadCount++;
+      continue;
+    }
+
+    const group = groups.get(originalCommitSha);
+    if (group) {
+      group.push(comment);
+    } else {
+      groups.set(originalCommitSha, [comment]);
+    }
+  }
+
+  return { groups, currentHeadCount, missingOriginalCommitCount };
+}
+
+function mergeFixEvaluationResults(
+  results: EvaluateFixAttemptsResult[]
+): EvaluateFixAttemptsResult {
+  return {
+    toResolve: results.flatMap((result) => result.toResolve),
+    toReply: results.flatMap((result) => result.toReply),
+    skipped: results.reduce((total, result) => total + result.skipped, 0),
+    evaluated: results.reduce((total, result) => total + result.evaluated, 0),
+    failedEvaluations: results.reduce((total, result) => total + result.failedEvaluations, 0),
+    uniqueFindingsEvaluated: results.reduce((total, result) => total + result.uniqueFindingsEvaluated, 0),
+    uniqueFindingsCodeChanged: results.reduce((total, result) => total + result.uniqueFindingsCodeChanged, 0),
+    uniqueFindingsResolved: results.reduce((total, result) => total + result.uniqueFindingsResolved, 0),
+    usage: aggregateUsage(results.map((result) => result.usage)),
+    evaluations: results.flatMap((result) => result.evaluations),
+  };
 }
 
 // -----------------------------------------------------------------------------
@@ -538,24 +592,49 @@ async function evaluateFixesAndResolveStale(
   ) {
     try {
       logGroup('Fix evaluation');
-      const unresolvedCount = commentsForFixEvaluation.filter((c) => !c.isResolved && c.threadId).length;
+
+      // Only evaluate comments that were posted on an earlier commit. If a comment was
+      // posted on the current headSha there are no follow-up changes to evaluate yet, and
+      // running fix evaluation would compare the entire PR diff (PR base to head) against a
+      // finding from this same run, producing spurious "Fix attempt detected" replies.
+      const headSha = context.pullRequest.headSha;
+      const {
+        groups: commentsByOriginalCommit,
+        currentHeadCount,
+        missingOriginalCommitCount,
+      } = groupCommentsForFixEvaluation(commentsForFixEvaluation, headSha);
+
+      const unresolvedCount = [...commentsByOriginalCommit.values()]
+        .flat()
+        .filter((c) => !c.isResolved && c.threadId).length;
       if (unresolvedCount > 0) {
         logAction(`Fix evaluation: evaluating ${unresolvedCount} unresolved comments`);
+      } else {
+        logAction(
+          `Fix evaluation: no eligible comments (${currentHeadCount} current head, ` +
+            `${missingOriginalCommitCount} missing original commit)`
+        );
       }
 
-      const fixEvaluation = await evaluateFixAttempts(
-        octokit,
-        commentsForFixEvaluation,
-        {
-          owner: context.repository.owner,
-          repo: context.repository.name,
-          baseSha: context.pullRequest.baseSha,
-          headSha: context.pullRequest.headSha,
-        },
-        allFindings,
-        anthropicApiKey,
-        { ...auxiliaryOptions, runtime: fixEvaluationRuntime }
-      );
+      const groupResults: EvaluateFixAttemptsResult[] = [];
+      for (const [commentBaseSha, groupComments] of commentsByOriginalCommit) {
+        groupResults.push(
+          await evaluateFixAttempts(
+            octokit,
+            groupComments,
+            {
+              owner: context.repository.owner,
+              repo: context.repository.name,
+              baseSha: commentBaseSha,
+              headSha,
+            },
+            allFindings,
+            anthropicApiKey,
+            { ...auxiliaryOptions, runtime: fixEvaluationRuntime }
+          )
+        );
+      }
+      const fixEvaluation = mergeFixEvaluationResults(groupResults);
 
       // Log per-evaluation details
       fixEvaluation.evaluations.forEach((ev, i) =>
